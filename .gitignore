@@ -2,4 +2,12 @@
 **/bin/
 **/obj/
 *.user
+*.suo
+
 appsettings.Development.json
+appsettings.*.json
+!appsettings.json
+
+.env
+.env.*
+!.env.example

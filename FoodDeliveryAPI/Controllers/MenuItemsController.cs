@@ -1,5 +1,4 @@
-﻿
-using FoodDeliveryAPI.Data;
+﻿using FoodDeliveryAPI.Data;
 using FoodDeliveryAPI.Data.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -18,6 +17,7 @@ public class MenuItemsController(FoodDeliveryDbContext context) : ControllerBase
         string? Description,
         decimal Price);
 
+    [AllowAnonymous]
     [HttpGet("restaurant/{restaurantId:int}")]
     public async Task<IActionResult> GetMenu(int restaurantId)
     {
@@ -28,6 +28,7 @@ public class MenuItemsController(FoodDeliveryDbContext context) : ControllerBase
             return NotFound("Restaurant not found.");
 
         var items = await context.MenuItems
+            .AsNoTracking()
             .Where(m => m.RestaurantId == restaurantId && m.IsAvailable)
             .Select(m => new
             {
@@ -49,18 +50,19 @@ public class MenuItemsController(FoodDeliveryDbContext context) : ControllerBase
     public async Task<IActionResult> Create(
         int restaurantId, MenuItemDto dto)
     {
-        var ownerId = int.Parse(
-            User.FindFirstValue(ClaimTypes.NameIdentifier)!);
-
-        var restaurant = await context.Restaurants.FirstOrDefaultAsync(
-            r => r.RestaurantId == restaurantId &&
-                 r.OwnerId == ownerId && r.IsActive);
-
-        if (restaurant == null)
-            return NotFound("Restaurant not found or not owned by you.");
+        if (!TryGetOwnerId(out var ownerId))
+            return Unauthorized();
 
         if (string.IsNullOrWhiteSpace(dto.Name) || dto.Price <= 0)
             return BadRequest("Name is required and price must be positive.");
+
+        var restaurant = await context.Restaurants.FirstOrDefaultAsync(
+            r => r.RestaurantId == restaurantId &&
+                 r.OwnerId == ownerId &&
+                 r.IsActive);
+
+        if (restaurant == null)
+            return NotFound("Restaurant not found or not owned by you.");
 
         var categoryExists = await context.Categories.AnyAsync(
             c => c.CategoryId == dto.CategoryId);
@@ -73,7 +75,9 @@ public class MenuItemsController(FoodDeliveryDbContext context) : ControllerBase
             RestaurantId = restaurantId,
             CategoryId = dto.CategoryId,
             Name = dto.Name.Trim(),
-            Description = dto.Description,
+            Description = string.IsNullOrWhiteSpace(dto.Description)
+                ? null
+                : dto.Description.Trim(),
             Price = dto.Price,
             IsAvailable = true
         };
@@ -81,34 +85,41 @@ public class MenuItemsController(FoodDeliveryDbContext context) : ControllerBase
         context.MenuItems.Add(item);
         await context.SaveChangesAsync();
 
-        return Ok(new
-        {
-            item.MenuItemId,
-            item.RestaurantId,
-            item.CategoryId,
-            item.Name,
-            item.Price
-        });
+        return CreatedAtAction(
+            nameof(GetMenu),
+            new { restaurantId },
+            new
+            {
+                item.MenuItemId,
+                item.RestaurantId,
+                item.CategoryId,
+                item.Name,
+                item.Description,
+                item.Price,
+                item.IsAvailable
+            });
     }
 
     [Authorize(Roles = "RestaurantOwner")]
     [HttpPut("{id:int}")]
     public async Task<IActionResult> Update(int id, MenuItemDto dto)
     {
-        var ownerId = int.Parse(
-            User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+        if (!TryGetOwnerId(out var ownerId))
+            return Unauthorized();
+
+        if (string.IsNullOrWhiteSpace(dto.Name) || dto.Price <= 0)
+            return BadRequest("Name is required and price must be positive.");
 
         var item = await context.MenuItems
             .Include(m => m.Restaurant)
             .FirstOrDefaultAsync(m =>
                 m.MenuItemId == id &&
-                m.Restaurant.OwnerId == ownerId);
+                m.Restaurant.OwnerId == ownerId &&
+                m.Restaurant.IsActive &&
+                m.IsAvailable);
 
         if (item == null)
-            return NotFound("Menu item not found or not owned by you.");
-
-        if (string.IsNullOrWhiteSpace(dto.Name) || dto.Price <= 0)
-            return BadRequest("Name is required and price must be positive.");
+            return NotFound("Available menu item not found or not owned by you.");
 
         var categoryExists = await context.Categories.AnyAsync(
             c => c.CategoryId == dto.CategoryId);
@@ -118,7 +129,9 @@ public class MenuItemsController(FoodDeliveryDbContext context) : ControllerBase
 
         item.CategoryId = dto.CategoryId;
         item.Name = dto.Name.Trim();
-        item.Description = dto.Description;
+        item.Description = string.IsNullOrWhiteSpace(dto.Description)
+            ? null
+            : dto.Description.Trim();
         item.Price = dto.Price;
 
         await context.SaveChangesAsync();
@@ -129,21 +142,30 @@ public class MenuItemsController(FoodDeliveryDbContext context) : ControllerBase
     [HttpDelete("{id:int}")]
     public async Task<IActionResult> Delete(int id)
     {
-        var ownerId = int.Parse(
-            User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+        if (!TryGetOwnerId(out var ownerId))
+            return Unauthorized();
 
         var item = await context.MenuItems
             .Include(m => m.Restaurant)
             .FirstOrDefaultAsync(m =>
                 m.MenuItemId == id &&
-                m.Restaurant.OwnerId == ownerId);
+                m.Restaurant.OwnerId == ownerId &&
+                m.Restaurant.IsActive &&
+                m.IsAvailable);
 
         if (item == null)
-            return NotFound("Menu item not found or not owned by you.");
+            return NotFound("Available menu item not found or not owned by you.");
 
         item.IsAvailable = false;
         await context.SaveChangesAsync();
 
         return NoContent();
+    }
+
+    private bool TryGetOwnerId(out int ownerId)
+    {
+        return int.TryParse(
+            User.FindFirstValue(ClaimTypes.NameIdentifier),
+            out ownerId);
     }
 }

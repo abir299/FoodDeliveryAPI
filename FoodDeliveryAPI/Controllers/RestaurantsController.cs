@@ -1,5 +1,4 @@
-﻿
-using FoodDeliveryAPI.Data;
+﻿using FoodDeliveryAPI.Data;
 using FoodDeliveryAPI.Data.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -12,10 +11,12 @@ namespace FoodDeliveryAPI.Controllers;
 [Route("api/[controller]")]
 public class RestaurantsController(FoodDeliveryDbContext context) : ControllerBase
 {
+    [AllowAnonymous]
     [HttpGet]
     public async Task<IActionResult> GetRestaurants()
     {
         var restaurants = await context.Restaurants
+            .AsNoTracking()
             .Where(r => r.IsActive)
             .Select(r => new
             {
@@ -29,10 +30,12 @@ public class RestaurantsController(FoodDeliveryDbContext context) : ControllerBa
         return Ok(restaurants);
     }
 
+    [AllowAnonymous]
     [HttpGet("{id:int}")]
     public async Task<IActionResult> GetRestaurant(int id)
     {
         var restaurant = await context.Restaurants
+            .AsNoTracking()
             .Where(r => r.RestaurantId == id && r.IsActive)
             .Select(r => new
             {
@@ -50,10 +53,13 @@ public class RestaurantsController(FoodDeliveryDbContext context) : ControllerBa
                         m.Price,
                         m.CategoryId
                     })
+                    .ToList()
             })
             .FirstOrDefaultAsync();
 
-        return restaurant == null ? NotFound() : Ok(restaurant);
+        return restaurant == null
+            ? NotFound("Restaurant not found.")
+            : Ok(restaurant);
     }
 
     public record RestaurantDto(
@@ -69,14 +75,18 @@ public class RestaurantsController(FoodDeliveryDbContext context) : ControllerBa
             string.IsNullOrWhiteSpace(dto.Address))
             return BadRequest("Restaurant name and address are required.");
 
-        var ownerId = int.Parse(
-            User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+        var ownerIdValue = User.FindFirstValue(ClaimTypes.NameIdentifier);
+
+        if (!int.TryParse(ownerIdValue, out var ownerId))
+            return Unauthorized();
 
         var restaurant = new Restaurant
         {
             OwnerId = ownerId,
             Name = dto.Name.Trim(),
-            Description = dto.Description,
+            Description = string.IsNullOrWhiteSpace(dto.Description)
+                ? null
+                : dto.Description.Trim(),
             Address = dto.Address.Trim(),
             IsActive = true
         };
@@ -87,7 +97,14 @@ public class RestaurantsController(FoodDeliveryDbContext context) : ControllerBa
         return CreatedAtAction(
             nameof(GetRestaurant),
             new { id = restaurant.RestaurantId },
-            new { restaurant.RestaurantId, restaurant.Name });
+            new
+            {
+                restaurant.RestaurantId,
+                restaurant.Name,
+                restaurant.Description,
+                restaurant.Address,
+                restaurant.IsActive
+            });
     }
 
     [Authorize(Roles = "RestaurantOwner")]
@@ -95,24 +112,31 @@ public class RestaurantsController(FoodDeliveryDbContext context) : ControllerBa
     public async Task<IActionResult> UpdateRestaurant(
         int id, RestaurantDto dto)
     {
-        var ownerId = int.Parse(
-            User.FindFirstValue(ClaimTypes.NameIdentifier)!);
-
-        var restaurant = await context.Restaurants.FirstOrDefaultAsync(
-            r => r.RestaurantId == id && r.OwnerId == ownerId);
-
-        if (restaurant == null)
-            return NotFound("Restaurant not found or not owned by you.");
-
         if (string.IsNullOrWhiteSpace(dto.Name) ||
             string.IsNullOrWhiteSpace(dto.Address))
             return BadRequest("Restaurant name and address are required.");
 
+        var ownerIdValue = User.FindFirstValue(ClaimTypes.NameIdentifier);
+
+        if (!int.TryParse(ownerIdValue, out var ownerId))
+            return Unauthorized();
+
+        var restaurant = await context.Restaurants.FirstOrDefaultAsync(
+            r => r.RestaurantId == id &&
+                 r.OwnerId == ownerId &&
+                 r.IsActive);
+
+        if (restaurant == null)
+            return NotFound("Restaurant not found or not owned by you.");
+
         restaurant.Name = dto.Name.Trim();
-        restaurant.Description = dto.Description;
+        restaurant.Description = string.IsNullOrWhiteSpace(dto.Description)
+            ? null
+            : dto.Description.Trim();
         restaurant.Address = dto.Address.Trim();
 
         await context.SaveChangesAsync();
+
         return NoContent();
     }
 
@@ -120,11 +144,15 @@ public class RestaurantsController(FoodDeliveryDbContext context) : ControllerBa
     [HttpDelete("{id:int}")]
     public async Task<IActionResult> DeleteRestaurant(int id)
     {
-        var ownerId = int.Parse(
-            User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+        var ownerIdValue = User.FindFirstValue(ClaimTypes.NameIdentifier);
+
+        if (!int.TryParse(ownerIdValue, out var ownerId))
+            return Unauthorized();
 
         var restaurant = await context.Restaurants.FirstOrDefaultAsync(
-            r => r.RestaurantId == id && r.OwnerId == ownerId);
+            r => r.RestaurantId == id &&
+                 r.OwnerId == ownerId &&
+                 r.IsActive);
 
         if (restaurant == null)
             return NotFound("Restaurant not found or not owned by you.");

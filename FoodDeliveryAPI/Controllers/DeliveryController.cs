@@ -1,5 +1,4 @@
-﻿
-using FoodDeliveryAPI.Data;
+﻿using FoodDeliveryAPI.Data;
 using FoodDeliveryAPI.Data.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -11,16 +10,25 @@ namespace FoodDeliveryAPI.Controllers;
 [ApiController]
 [Route("api/[controller]")]
 [Authorize(Roles = "DeliveryPerson")]
-public class DeliveryController(FoodDeliveryDbContext context) : ControllerBase
+public class DeliveryController(FoodDeliveryDbContext context)
+    : ControllerBase
 {
-    private int DeliveryPersonId => int.Parse(
-        User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    private bool TryGetDeliveryPersonId(out int deliveryPersonId)
+    {
+        return int.TryParse(
+            User.FindFirstValue(ClaimTypes.NameIdentifier),
+            out deliveryPersonId);
+    }
 
     [HttpGet("my-assignments")]
     public async Task<IActionResult> GetMyAssignments()
     {
+        if (!TryGetDeliveryPersonId(out var deliveryPersonId))
+            return Unauthorized();
+
         var assignments = await context.DeliveryAssignments
-            .Where(a => a.DeliveryPersonId == DeliveryPersonId)
+            .AsNoTracking()
+            .Where(a => a.DeliveryPersonId == deliveryPersonId)
             .OrderByDescending(a => a.AssignedAt)
             .Select(a => new
             {
@@ -41,31 +49,38 @@ public class DeliveryController(FoodDeliveryDbContext context) : ControllerBase
     [HttpPut("{assignmentId:int}/delivered")]
     public async Task<IActionResult> MarkDelivered(int assignmentId)
     {
+        if (assignmentId <= 0)
+            return BadRequest("Invalid assignment ID.");
+
+        if (!TryGetDeliveryPersonId(out var deliveryPersonId))
+            return Unauthorized();
+
         var assignment = await context.DeliveryAssignments
             .Include(a => a.Order)
             .FirstOrDefaultAsync(a =>
                 a.AssignmentId == assignmentId &&
-                a.DeliveryPersonId == DeliveryPersonId);
+                a.DeliveryPersonId == deliveryPersonId);
 
         if (assignment == null)
             return NotFound("Delivery assignment not found.");
 
-        if (assignment.Order.Status.Trim() != "OutForDelivery")
-            return BadRequest("Order is not out for delivery.");
-
-        var userId = DeliveryPersonId;
         var oldStatus = assignment.Order.Status.Trim();
 
+        if (oldStatus != "OutForDelivery")
+            return BadRequest("Order is not out for delivery.");
+
+        var deliveredAt = DateTime.UtcNow;
+
         assignment.Order.Status = "Delivered";
-        assignment.DeliveredAt = DateTime.UtcNow;
+        assignment.DeliveredAt = deliveredAt;
 
         context.OrderStatusHistories.Add(new OrderStatusHistory
         {
             OrderId = assignment.OrderId,
             OldStatus = oldStatus,
             NewStatus = "Delivered",
-            ChangedBy = userId,
-            ChangedAt = DateTime.UtcNow
+            ChangedBy = deliveryPersonId,
+            ChangedAt = deliveredAt
         });
 
         await context.SaveChangesAsync();

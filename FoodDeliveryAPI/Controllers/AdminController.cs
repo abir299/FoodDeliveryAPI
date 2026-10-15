@@ -1,5 +1,4 @@
-﻿
-using FoodDeliveryAPI.Data;
+﻿using FoodDeliveryAPI.Data;
 using FoodDeliveryAPI.Data.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -24,12 +23,15 @@ public class AdminController(FoodDeliveryDbContext context) : ControllerBase
             TotalRestaurants = await context.Restaurants.CountAsync(),
             TotalMenuItems = await context.MenuItems.CountAsync(),
             TotalOrders = await context.Orders.CountAsync(),
+
             PendingOrders = await context.Orders.CountAsync(
-                o => o.Status == "Pending"),
+                o => o.Status.Trim() == "Pending"),
+
             DeliveredOrders = await context.Orders.CountAsync(
-                o => o.Status == "Delivered"),
+                o => o.Status.Trim() == "Delivered"),
+
             TotalRevenue = await context.Orders
-                .Where(o => o.Status == "Delivered")
+                .Where(o => o.Status.Trim() == "Delivered")
                 .SumAsync(o => (decimal?)o.TotalAmount) ?? 0m
         };
 
@@ -43,8 +45,10 @@ public class AdminController(FoodDeliveryDbContext context) : ControllerBase
         if (page < 1 || pageSize < 1 || pageSize > 100)
             return BadRequest("Invalid pagination values.");
 
-        var query = context.Orders.AsNoTracking()
-            .OrderByDescending(o => o.CreatedAt);
+        var query = context.Orders
+            .AsNoTracking()
+            .OrderByDescending(o => o.CreatedAt)
+            .ThenByDescending(o => o.OrderId);
 
         var total = await query.CountAsync();
 
@@ -62,69 +66,118 @@ public class AdminController(FoodDeliveryDbContext context) : ControllerBase
             })
             .ToListAsync();
 
-        return Ok(new { total, page, pageSize, orders });
+        return Ok(new
+        {
+            total,
+            page,
+            pageSize,
+            totalPages = (int)Math.Ceiling(total / (double)pageSize),
+            orders
+        });
     }
 
     [HttpPost("orders/{orderId:int}/assign-delivery")]
     public async Task<IActionResult> AssignDelivery(
         int orderId, AssignDeliveryDto dto)
     {
+        if (orderId <= 0 || dto.DeliveryPersonId <= 0)
+            return BadRequest("Invalid order or delivery person ID.");
+
+        if (!int.TryParse(
+                User.FindFirstValue(ClaimTypes.NameIdentifier),
+                out var adminId))
+        {
+            return Unauthorized();
+        }
+
         var order = await context.Orders
             .FirstOrDefaultAsync(o => o.OrderId == orderId);
 
         if (order == null)
             return NotFound("Order not found.");
 
-        if (order.Status.Trim() != "Ready")
-            return BadRequest("Only Ready orders can be assigned.");
+        var currentStatus = order.Status.Trim();
 
-        var deliveryPerson = await context.Users
+        if (currentStatus is "Delivered" or "Cancelled")
+            return BadRequest(
+                "Cannot assign a completed or cancelled order.");
+
+        if (currentStatus is not ("Ready" or "OutForDelivery"))
+            return BadRequest(
+                "Only Ready or OutForDelivery orders can be assigned.");
+
+        var newDeliveryPerson = await context.Users
+            .AsNoTracking()
             .FirstOrDefaultAsync(u =>
                 u.UserId == dto.DeliveryPersonId &&
                 u.Role.Trim() == "DeliveryPerson");
 
-        if (deliveryPerson == null)
-            return BadRequest("Valid delivery person not found.");
-
-        if (await context.DeliveryAssignments.AnyAsync(
-            a => a.OrderId == orderId))
-            return Conflict("Order already has a delivery assignment.");
-
-        var userId = int.Parse(
-            User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+        if (newDeliveryPerson == null)
+            return BadRequest("Invalid delivery person.");
 
         await using var transaction =
             await context.Database.BeginTransactionAsync();
 
-        var assignment = new DeliveryAssignment
+        try
         {
-            OrderId = orderId,
-            DeliveryPersonId = dto.DeliveryPersonId,
-            AssignedAt = DateTime.UtcNow
-        };
+            var assignment = await context.DeliveryAssignments
+                .FirstOrDefaultAsync(a => a.OrderId == orderId);
 
-        order.Status = "OutForDelivery";
-        context.DeliveryAssignments.Add(assignment);
+            if (assignment?.DeliveredAt != null)
+                return BadRequest(
+                    "This order has already been delivered.");
 
-        context.OrderStatusHistories.Add(new OrderStatusHistory
+            var now = DateTime.UtcNow;
+
+            if (assignment == null)
+            {
+                assignment = new DeliveryAssignment
+                {
+                    OrderId = orderId,
+                    DeliveryPersonId = dto.DeliveryPersonId,
+                    AssignedAt = now
+                };
+
+                context.DeliveryAssignments.Add(assignment);
+            }
+            else
+            {
+                assignment.DeliveryPersonId = dto.DeliveryPersonId;
+                assignment.AssignedAt = now;
+                assignment.DeliveredAt = null;
+            }
+
+            if (currentStatus == "Ready")
+            {
+                order.Status = "OutForDelivery";
+
+                context.OrderStatusHistories.Add(
+                    new OrderStatusHistory
+                    {
+                        OrderId = orderId,
+                        OldStatus = currentStatus,
+                        NewStatus = "OutForDelivery",
+                        ChangedBy = adminId,
+                        ChangedAt = now
+                    });
+            }
+
+            await context.SaveChangesAsync();
+            await transaction.CommitAsync();
+
+            return Ok(new
+            {
+                assignment.AssignmentId,
+                assignment.OrderId,
+                assignment.DeliveryPersonId,
+                assignment.AssignedAt,
+                Status = order.Status
+            });
+        }
+        catch
         {
-            OrderId = orderId,
-            OldStatus = "Ready",
-            NewStatus = "OutForDelivery",
-            ChangedBy = userId,
-            ChangedAt = DateTime.UtcNow
-        });
-
-        await context.SaveChangesAsync();
-        await transaction.CommitAsync();
-
-        return Ok(new
-        {
-            assignment.AssignmentId,
-            assignment.OrderId,
-            assignment.DeliveryPersonId,
-            assignment.AssignedAt,
-            Status = order.Status
-        });
+            await transaction.RollbackAsync();
+            throw;
+        }
     }
 }

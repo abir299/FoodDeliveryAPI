@@ -1,5 +1,4 @@
-﻿
-using FoodDeliveryAPI.Data;
+﻿using FoodDeliveryAPI.Data;
 using FoodDeliveryAPI.Data.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -11,7 +10,8 @@ namespace FoodDeliveryAPI.Controllers;
 [ApiController]
 [Route("api/[controller]")]
 [Authorize(Roles = "Admin")]
-public class OrderStatusController(FoodDeliveryDbContext context) : ControllerBase
+public class OrderStatusController(FoodDeliveryDbContext context)
+    : ControllerBase
 {
     public record UpdateStatusDto(string Status);
 
@@ -19,31 +19,52 @@ public class OrderStatusController(FoodDeliveryDbContext context) : ControllerBa
     public async Task<IActionResult> UpdateStatus(
         int orderId, UpdateStatusDto dto)
     {
-        var order = await context.Orders.FindAsync(orderId);
-        if (order == null) return NotFound("Order not found.");
+        if (orderId <= 0)
+            return BadRequest("Invalid order ID.");
 
-        var next = dto.Status.Trim();
+        if (string.IsNullOrWhiteSpace(dto.Status))
+            return BadRequest("Status is required.");
+
+        if (!int.TryParse(
+                User.FindFirstValue(ClaimTypes.NameIdentifier),
+                out var userId))
+        {
+            return Unauthorized();
+        }
+
+        var order = await context.Orders
+            .FirstOrDefaultAsync(o => o.OrderId == orderId);
+
+        if (order == null)
+            return NotFound("Order not found.");
+
         var current = order.Status.Trim();
+        var requested = dto.Status.Trim();
 
         var allowed = current switch
         {
             "Pending" => new[] { "Confirmed", "Cancelled" },
             "Confirmed" => new[] { "Preparing", "Cancelled" },
-            "Preparing" => new[] { "Ready" },
+            "Preparing" => new[] { "Ready", "Cancelled" },
+            "Ready" => new[] { "OutForDelivery", "Cancelled" },
             _ => Array.Empty<string>()
         };
 
-        if (!allowed.Contains(next))
-            return BadRequest($"Cannot change order from {current} to {next}.");
+        var next = allowed.FirstOrDefault(s =>
+            string.Equals(
+                s, requested, StringComparison.OrdinalIgnoreCase));
 
-        var userId = int.Parse(
-            User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+        if (next == null)
+        {
+            return BadRequest(
+                $"Cannot change order from {current} to {requested}.");
+        }
 
         order.Status = next;
 
         context.OrderStatusHistories.Add(new OrderStatusHistory
         {
-            OrderId = orderId,
+            OrderId = order.OrderId,
             OldStatus = current,
             NewStatus = next,
             ChangedBy = userId,
@@ -52,18 +73,31 @@ public class OrderStatusController(FoodDeliveryDbContext context) : ControllerBa
 
         await context.SaveChangesAsync();
 
-        return Ok(new { order.OrderId, order.Status });
+        return Ok(new
+        {
+            order.OrderId,
+            OldStatus = current,
+            order.Status
+        });
     }
 
     [HttpGet("{orderId:int}/history")]
     public async Task<IActionResult> GetHistory(int orderId)
     {
-        if (!await context.Orders.AnyAsync(o => o.OrderId == orderId))
+        if (orderId <= 0)
+            return BadRequest("Invalid order ID.");
+
+        var orderExists = await context.Orders
+            .AnyAsync(o => o.OrderId == orderId);
+
+        if (!orderExists)
             return NotFound("Order not found.");
 
         var history = await context.OrderStatusHistories
+            .AsNoTracking()
             .Where(h => h.OrderId == orderId)
             .OrderBy(h => h.ChangedAt)
+            .ThenBy(h => h.HistoryId)
             .Select(h => new
             {
                 h.HistoryId,
